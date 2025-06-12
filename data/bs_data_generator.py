@@ -1,125 +1,70 @@
-# train/train_model.py
+# data/bs_data_generator.py
 
-import sys
-import os
-# ─ Add project root to PYTHONPATH for clean imports ──────────────────
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
+import numpy as np
 import pandas as pd
-import torch
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-from models.dml_model import OptionMLP
-from losses.differential_loss import differential_loss
+from scipy.stats import norm
 
+def black_scholes_call_price(S, K, T, r, sigma):
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
 
-class OptionDataset(Dataset):
-    """Wraps CSV of [S, K, T, r, sigma, price, delta, vega] into a torch Dataset."""
-    def __init__(self, csv_path: str):
-        df = pd.read_csv(csv_path)
-        self.x     = torch.tensor(df[['S','K','T','r','sigma']].values, dtype=torch.float32)
-        self.price = torch.tensor(df['price'].values,                        dtype=torch.float32)
-        self.delta = torch.tensor(df['delta'].values,                        dtype=torch.float32)
-        self.vega  = torch.tensor(df['vega'].values,                         dtype=torch.float32)
+def black_scholes_delta(S, K, T, r, sigma):
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    return norm.cdf(d1)
 
-    def __len__(self) -> int:
-        return len(self.x)
+def black_scholes_vega(S, K, T, r, sigma):
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    return S * norm.pdf(d1) * np.sqrt(T)
 
-    def __getitem__(self, idx: int):
-        return self.x[idx], self.price[idx], self.delta[idx], self.vega[idx]
-
-
-def train_epoch(model, loader, optimizer, device, λ_delta, λ_vega, dataset_size):
-    """One training epoch—returns avg composite loss."""
-    model.train()
-    total_loss = 0.0
-
-    for x, price, delta, vega in loader:
-        x, price, delta, vega = [t.to(device) for t in (x, price, delta, vega)]
-        optimizer.zero_grad()
-        loss = differential_loss(model, x, price, delta, vega, λ_delta, λ_vega)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * x.size(0)
-
-    return total_loss / dataset_size
-
-
-def evaluate(model, loader, device, λ_delta, λ_vega, dataset_size):
+def generate_synthetic_data(n_samples=10000, 
+                            seed=42, 
+                            augment: bool = True, 
+                            noise_std: float = 0.01) -> pd.DataFrame:
     """
-    One validation epoch—returns avg composite loss.
-    Uses torch.enable_grad() so we can compute Greeks via AAD.
+    Generates BSM prices + Greeks, plus optional percent‐noise augmentation.
     """
-    model.eval()
-    total_loss = 0.0
+    np.random.seed(seed)
+    S     = np.random.uniform(50, 150, n_samples)
+    K     = np.random.uniform(50, 150, n_samples)
+    T     = np.random.uniform(0.1, 2.0, n_samples)
+    r     = np.random.uniform(0.01, 0.05, n_samples)
+    sigma = np.random.uniform(0.1, 0.5, n_samples)
 
-    for x, price, delta, vega in loader:
-        x, price, delta, vega = [t.to(device) for t in (x, price, delta, vega)]
-        # allow gradients here for AAD
-        with torch.enable_grad():
-            loss = differential_loss(model, x, price, delta, vega, λ_delta, λ_vega)
-        total_loss += loss.item() * x.size(0)
+    # base dataset
+    df = pd.DataFrame({
+        'S':      S,
+        'K':      K,
+        'T':      T,
+        'r':      r,
+        'sigma':  sigma,
+        'price':  black_scholes_call_price(S, K, T, r, sigma),
+        'delta':  black_scholes_delta(S, K, T, r, sigma),
+        'vega':   black_scholes_vega(S, K, T, r, sigma)
+    })
 
-    return total_loss / dataset_size
+    if augment:
+        # percent-noise augmentation
+        X = np.stack([S, K, T, r, sigma], axis=1)
+        noise = np.random.normal(0, noise_std, size=X.shape)
+        X_aug = X * (1 + noise)
+        S2, K2, T2, r2, sigma2 = X_aug.T
 
+        df_aug = pd.DataFrame({
+            'S':      S2,
+            'K':      K2,
+            'T':      T2,
+            'r':      r2,
+            'sigma':  sigma2,
+            'price':  black_scholes_call_price(S2, K2, T2, r2, sigma2),
+            'delta':  black_scholes_delta(S2, K2, T2, r2, sigma2),
+            'vega':   black_scholes_vega(S2, K2, T2, r2, sigma2)
+        })
+        df = pd.concat([df, df_aug], ignore_index=True)
 
-def main():
-    # ─── Config ───────────────────────────────────────────────
-    data_csv    = "data/option_data.csv"
-    batch_size  = 256
-    epochs      = 50
-    lr          = 1e-3
-    λ_delta     = 1.0
-    λ_vega      = 1.0
-    ckpt_path   = "dml_pricer_best.pth"
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Init] Using device: {device}\n")
-
-    # ─── Step 1: Load & Split Data ─────────────────────────────
-    print("[Step 1] Loading data & creating train/val split...")
-    df = pd.read_csv(data_csv)
-    train_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
-    os.makedirs("data", exist_ok=True)
-    train_df.to_csv("data/train.csv", index=False)
-    val_df.to_csv("data/val.csv",   index=False)
-
-    train_ds = OptionDataset("data/train.csv")
-    val_ds   = OptionDataset("data/val.csv")
-    train_size, val_size = len(train_ds), len(val_ds)
-    print(f"         → train_size: {train_size}, val_size: {val_size}\n")
-
-    # ─── Step 2: DataLoaders ────────────────────────────────────
-    print("[Step 2] Creating DataLoaders...")
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=2)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=2)
-    print(f"         → Batch size: {batch_size}\n")
-
-    # ─── Step 3: Model & Optimizer ─────────────────────────────
-    print("[Step 3] Initializing model & optimizer...")
-    model     = OptionMLP().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    print(f"         → Learning rate: {lr}\n")
-
-    # ─── Step 4: Training Loop ─────────────────────────────────
-    print("[Step 4] Starting training...\n")
-    best_val_loss = float("inf")
-
-    for epoch in range(1, epochs + 1):
-        train_loss = train_epoch(model, train_loader, optimizer, device, λ_delta, λ_vega, train_size)
-        val_loss   = evaluate(model, val_loader,   device, λ_delta, λ_vega, val_size)
-
-        print(f" Epoch {epoch:02d}/{epochs:02d} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), ckpt_path)
-            print(f"    ✅ New best model saved (val_loss={val_loss:.6f})\n")
-
-    print("\n[Done] Training complete.")
-    print(f"       Best val_loss: {best_val_loss:.6f} (checkpoint: {ckpt_path})")
-
+    return df
 
 if __name__ == "__main__":
-    main()
+    df = generate_synthetic_data(n_samples=20000, augment=True)
+    df.to_csv("data/option_data.csv", index=False)
+    print("✅ Generated and saved augmented data to data/option_data.csv")
