@@ -1,4 +1,3 @@
-````markdown
 # 🔥 Differential ML Option Pricer
 
 Interactive ML-based pricer with AAD-computed Greeks vs. a Black-Scholes baseline.
