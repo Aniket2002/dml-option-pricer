@@ -100,8 +100,7 @@ dml-option-pricer/
 ## 📞 Contact
 
 **Aniket Bhardwaj**
-✉️ [aniket.bhardwaj@domain.com](mailto:bhardwaj.aniket2002@gmail.com)
+✉️ [bhardwaj.aniket2002@gmail.com](mailto:bhardwaj.aniket2002@gmail.com)
 🔗 [LinkedIn](https://www.linkedin.com/in/aniket-bhardwaj-b002/)
 
-```
-```
+---
