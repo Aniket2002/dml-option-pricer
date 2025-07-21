@@ -9,9 +9,20 @@ Interactive ML-based pricer with AAD-computed Greeks vs. a Black-Scholes baselin
 
 ## 📸 Dashboard Preview
 
-![Dashboard - Overview Screenshot](docs/dashboard1.png)
-![Dashboard - Deep Analysis Screenshot](docs/dashboard2.png)
-![Dashboard - Charts Screenshot](docs/charts.png)
+![Dashboard - Overview](docs/dashboard1.png)
+![Dashboard - Deep Analysis](docs/dashboard2.jpg)
+
+---
+
+
+---
+
+## 📸 Charts Preview
+
+![Charts - Price Error Heatmap](docs/heatmap.jpg)
+![Charts - Price Error](docs/price_error.jpg)
+![Charts - Vega Error](docs/vega_error.jpg)
+![Charts - Delta Error](docs/delta_error.jpg)
 
 ---
 
