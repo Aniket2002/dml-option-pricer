@@ -1,106 +1,148 @@
-# 🔥 Differential ML Option Pricer
+# Differential ML Option Pricer
 
-Interactive ML-based pricer with AAD-computed Greeks vs. a Black-Scholes baseline.
+A reproducible PyTorch surrogate for **no-dividend European call options**. The model is trained on Black-Scholes prices together with analytic delta and vega labels, then evaluated against the same closed-form benchmark on a held-out synthetic test set.
 
-> **Executive Summary:**  
-> Our ML pricer achieves **< 1% price RMSE** and **single-digit Greek RMSE** across typical domains (Spot ∈ [50,150], T ∈ [0.1,2]).  
+## What is different about this implementation
 
----
+- **Differential supervision:** the objective includes price, delta and vega errors.
+- **Correct derivative units:** feature scaling occurs inside the neural computational graph, so `torch.autograd.grad` returns delta and vega with respect to the original financial inputs. No manual scaler correction is required.
+- **Comparable loss terms:** price, delta and vega residuals are divided by training-set scales before weighting.
+- **Call-price bounds:** the network output is constrained to
+  `max(S - K exp(-rT), 0) <= C <= S`.
+- **Reproducible splits and seeds:** data generation, train/validation/test splits and loaders use explicit seeds.
+- **Generated evidence:** the training script writes held-out metrics to `artifacts/metrics.json`; the README does not hard-code performance claims.
+- **Defensive tests and CI:** analytic Black-Scholes values, raw-unit Greeks, bounds, checkpoint compatibility and training utilities are tested on Python 3.10-3.12.
 
-## 📸 Dashboard Preview
+## Scope
 
-![Dashboard - Overview](docs/dashboard1.png)
-![Dashboard - Deep Analysis](docs/dashboard2.jpg)
+The current model covers:
 
----
+- European calls;
+- no dividends;
+- constant volatility and continuously compounded rates;
+- inputs `[S, K, T, r, sigma]`;
+- outputs price, delta and vega.
 
+It is an educational surrogate-model project, not a market-calibrated pricing system.
 
----
+## Installation
 
-## 📸 Charts Preview
-
-![Charts - Price Error Heatmap](docs/heatmap.jpg)
-![Charts - Price Error](docs/price_error.jpg)
-![Charts - Vega Error](docs/vega_error.jpg)
-![Charts - Delta Error](docs/delta_error.jpg)
-
----
-
-## 🚀 Quick Start
-
-**Requires Python 3.10+**
+Tested in CI on Python 3.10, 3.11 and 3.12.
 
 ```bash
-# 1️⃣ Clone
-git clone https://github.com/yourusername/dml-option-pricer.git
-cd dml-option-pricer
+python -m venv .venv
+```
 
-# 2️⃣ Install (via Pipenv)
-pip install pipenv
-pipenv install --dev      # uses Pipfile.lock
-pipenv shell
+Activate the environment, then run:
 
-# 3️⃣ Generate data & train (optional)
-python data/bs_data_generator.py
-python train/train_model.py
+```bash
+pip install -r requirements.txt
+pip install -r requirements-dev.txt
+```
 
-# 4️⃣ Launch
-streamlit run streamlit_app/app.py --server.fileWatcherType none
-````
+## Train
 
----
+A standard training run:
 
-## 🎯 Core Highlights
+```bash
+python -m train.train_model
+```
 
-| 🚀 Feature                              | 💡 Benefit                                                       |
-| --------------------------------------- | ---------------------------------------------------------------- |
-| **Differential Supervision**            | Trains on both price & analytic Greeks                           |
-| **Adjoint Algorithmic Differentiation** | Exact Δ, Vega via `torch.autograd.grad`                          |
-| **Hyperparameter Sweep**                | Optimized for best RMSEs: Price < 1%, Δ < 0.03, Vega < 1.7       |
-| **Reproducibility**                     | `Pipfile.lock` guarantees identical envs                         |
-| **Interactive Dashboard**               | Overview & Deep Analysis with error tables, heatmaps, and slices |
+Train the DML model and a price-only benchmark on the same split:
 
----
+```bash
+python -m train.train_model --compare-baseline
+```
 
-## 📈 Key Results
+Useful development-sized run:
 
-| Metric    | BSM Value | ML Value | Absolute Error | Relative Error |
-| --------- | --------- | -------- | -------------- | -------------- |
-| **Price** | 8.4333    | 8.8884   | 0.4551         | 5.40 %         |
-| **Delta** | 0.5596    | 0.6044   | 0.0448         | 8.01 %         |
-| **Vega**  | 39.4479   | 41.2191  | 1.7711         | 4.49 %         |
+```bash
+python -m train.train_model --samples 5000 --epochs 20 --batch-size 256
+```
 
----
+The script creates:
 
-## 🗂 Repository Layout
+```text
+artifacts/dml_option_pricer.pt
+artifacts/metrics.json
+```
+
+The checkpoint stores the model state, input-scaling statistics, architecture and training metadata. Legacy state-dict-only checkpoints are intentionally rejected because they do not contain the scaling information needed for correct raw-unit Greeks.
+
+## Dashboard
+
+After training:
+
+```bash
+streamlit run streamlit_app/app.py
+```
+
+The dashboard:
+
+- compares neural price, delta and vega with Black-Scholes values;
+- warns when inputs are outside the training domain;
+- displays held-out metrics from the checkpoint rather than fixed claims;
+- plots price, delta and vega error surfaces;
+- exports a model card as JSON.
+
+## Tests and linting
+
+```bash
+python -m ruff check .
+python -m pytest -q \
+  --cov=data \
+  --cov=models \
+  --cov=losses \
+  --cov=train \
+  --cov-report=term-missing \
+  --cov-fail-under=75
+```
+
+## Mathematical conventions
+
+For a no-dividend European call:
+
+```text
+d1 = [ln(S/K) + (r + 0.5 sigma^2)T] / (sigma sqrt(T))
+d2 = d1 - sigma sqrt(T)
+C  = S N(d1) - K exp(-rT) N(d2)
+Delta = N(d1)
+Vega  = S phi(d1) sqrt(T)
+```
+
+Vega is reported per **1.00** change in volatility. Divide it by 100 for a one-volatility-point sensitivity.
+
+## Repository layout
 
 ```text
 dml-option-pricer/
-├── data/                   # BSM data generator + augmentation
-├── models/                 # Differentiable MLP (OptionMLP)
-├── losses/                 # Composite price+Greek loss (AAD)
-├── train/                  # Training loop + hyperparameter sweep
-├── notebooks/              # Jupyter analyses & visualizations
-├── streamlit_app/          # Streamlit dashboard
-├── requirements.txt        # fallback for pip
-└── LICENSE
+├── data/
+│   └── bs_data_generator.py
+├── losses/
+│   └── differential_loss.py
+├── models/
+│   └── dml_model.py
+├── train/
+│   └── train_model.py
+├── streamlit_app/
+│   └── app.py
+├── tests/
+├── artifacts/
+├── .github/workflows/ci.yml
+├── requirements.txt
+├── requirements-dev.txt
+├── pyproject.toml
+└── README.md
 ```
 
----
+## Limitations
 
-## 🔍 Forward Roadmap
+- Synthetic Black-Scholes supervision is not market validation.
+- The model does not handle dividends, American exercise, barriers, stochastic volatility or jumps.
+- Accuracy outside the sampled domain is not established.
+- The annualized rate and volatility conventions must match the Black-Scholes inputs.
+- The no-arbitrage output layer enforces simple call bounds, not every static-arbitrage relationship across an entire surface.
 
-1. **Benchmark Latency** & optimize model size
-2. **Integrate Real Market Data** (WebSocket feeds)
-3. **Production Hardening** (Docker, CI/CD, monitoring)
-4. **Enhanced Analytics** (vol-surface calibration, risk attribution)
+## Suggested CV wording
 
----
-
-## 📞 Contact
-
-**Aniket Bhardwaj**
-✉️ [bhardwaj.aniket2002@gmail.com](mailto:bhardwaj.aniket2002@gmail.com)
-🔗 [LinkedIn](https://www.linkedin.com/in/aniket-bhardwaj-b002/)
-
----
+> Developed a differentiable PyTorch surrogate for European call pricing, using joint price-and-Greek supervision, in-graph feature scaling for raw-unit autograd Greeks, no-arbitrage output bounds, reproducible benchmarking and an interactive error-analysis dashboard.

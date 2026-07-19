@@ -1,266 +1,450 @@
-# train/train_model.py
+from __future__ import annotations
 
-import sys
-import os
-import itertools
+import argparse
+import copy
+import json
+import math
+import random
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch import Tensor, nn
+from torch.utils.data import DataLoader, TensorDataset
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from data.bs_data_generator import SamplingBounds, generate_synthetic_data
+from losses.differential_loss import (
+    DifferentialLossWeights,
+    LossScales,
+    differential_loss,
+    loss_metadata,
+    price_only_loss,
+)
+from models.dml_model import OptionMLP, price_and_greeks, save_checkpoint
 
-from models.dml_model import OptionMLP
-from losses.differential_loss import differential_loss
-from data.bs_data_generator import split_base_data, augment_dataframe
-
-
-FEATURE_COLS = ["S", "K", "T", "r", "sigma"]
-TARGET_COLS = ["price", "delta", "vega"]
-
-
-class OptionDataset(Dataset):
-    """Wrap a DataFrame into normalized tensors."""
-
-    def __init__(self, df: pd.DataFrame, feature_mean: pd.Series, feature_std: pd.Series):
-        x = df[FEATURE_COLS].copy()
-        x = (x - feature_mean) / feature_std
-
-        self.x = torch.tensor(x.values, dtype=torch.float32)
-        self.price = torch.tensor(df["price"].values, dtype=torch.float32)
-        self.delta = torch.tensor(df["delta"].values, dtype=torch.float32)
-        self.vega = torch.tensor(df["vega"].values, dtype=torch.float32)
-
-    def __len__(self) -> int:
-        return len(self.x)
-
-    def __getitem__(self, idx: int):
-        return self.x[idx], self.price[idx], self.delta[idx], self.vega[idx]
+FEATURE_COLUMNS = ["S", "K", "T", "r", "sigma"]
+TARGET_COLUMNS = ["price", "delta", "vega"]
 
 
-def train_epoch(model, loader, optimizer, device, lambda_delta, lambda_vega, n_obs, s_scale, sigma_scale):
-    model.train()
-    sums = {"total": 0.0, "price": 0.0, "delta": 0.0, "vega": 0.0}
+@dataclass(frozen=True)
+class TrainingConfig:
+    samples: int = 20_000
+    seed: int = 42
+    epochs: int = 80
+    batch_size: int = 512
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-6
+    patience: int = 12
+    validation_fraction: float = 0.15
+    test_fraction: float = 0.15
+    hidden_dims: tuple[int, ...] = (128, 128, 64)
+    gradient_clip: float = 5.0
 
-    for x, price, delta, vega in loader:
-        x, price, delta, vega = [t.to(device) for t in (x, price, delta, vega)]
-        optimizer.zero_grad()
-        total_loss, mets = differential_loss(
-            model,
-            x,
-            price,
-            delta,
-            vega,
-            lambda_delta,
-            lambda_vega,
-            s_scale=s_scale,
-            sigma_scale=sigma_scale,
-        )
-        total_loss.backward()
-        optimizer.step()
-
-        b = x.size(0)
-        sums["total"] += total_loss.item() * b
-        sums["price"] += mets["price"].item() * b
-        sums["delta"] += mets["delta"].item() * b
-        sums["vega"] += mets["vega"].item() * b
-
-    return {
-        "total": sums["total"] / n_obs,
-        "price": (sums["price"] / n_obs) ** 0.5,
-        "delta": (sums["delta"] / n_obs) ** 0.5,
-        "vega": (sums["vega"] / n_obs) ** 0.5,
-    }
+    def validate(self) -> None:
+        if self.samples < 100:
+            raise ValueError("samples must be at least 100")
+        if self.epochs <= 0 or self.batch_size <= 0:
+            raise ValueError("epochs and batch_size must be positive")
+        if self.learning_rate <= 0 or self.weight_decay < 0:
+            raise ValueError("invalid optimizer settings")
+        if self.patience <= 0:
+            raise ValueError("patience must be positive")
+        if not 0 < self.validation_fraction < 1:
+            raise ValueError("validation_fraction must be between zero and one")
+        if not 0 < self.test_fraction < 1:
+            raise ValueError("test_fraction must be between zero and one")
+        if self.validation_fraction + self.test_fraction >= 1:
+            raise ValueError("validation and test fractions must sum to less than one")
+        if self.gradient_clip <= 0:
+            raise ValueError("gradient_clip must be positive")
 
 
-def evaluate(model, loader, device, lambda_delta, lambda_vega, n_obs, s_scale, sigma_scale):
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():  # pragma: no cover - depends on runner
+        torch.cuda.manual_seed_all(seed)
+
+
+def split_frame(
+    frame: pd.DataFrame,
+    *,
+    seed: int,
+    validation_fraction: float,
+    test_fraction: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if len(frame) < 3:
+        raise ValueError("frame must contain at least three rows")
+
+    rng = np.random.default_rng(seed)
+    indices = rng.permutation(len(frame))
+    test_count = max(1, int(round(len(frame) * test_fraction)))
+    validation_count = max(1, int(round(len(frame) * validation_fraction)))
+    if test_count + validation_count >= len(frame):
+        raise ValueError("split fractions leave no training rows")
+
+    test_indices = indices[:test_count]
+    validation_indices = indices[test_count : test_count + validation_count]
+    training_indices = indices[test_count + validation_count :]
+    return (
+        frame.iloc[training_indices].reset_index(drop=True),
+        frame.iloc[validation_indices].reset_index(drop=True),
+        frame.iloc[test_indices].reset_index(drop=True),
+    )
+
+
+def frame_to_tensors(frame: pd.DataFrame) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    missing = set(FEATURE_COLUMNS + TARGET_COLUMNS) - set(frame.columns)
+    if missing:
+        raise ValueError(f"frame is missing columns: {sorted(missing)}")
+
+    features = torch.tensor(frame[FEATURE_COLUMNS].to_numpy(), dtype=torch.float32)
+    price = torch.tensor(frame["price"].to_numpy(), dtype=torch.float32)
+    delta = torch.tensor(frame["delta"].to_numpy(), dtype=torch.float32)
+    vega = torch.tensor(frame["vega"].to_numpy(), dtype=torch.float32)
+    return features, price, delta, vega
+
+
+def make_loader(
+    tensors: tuple[Tensor, Tensor, Tensor, Tensor],
+    *,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+) -> DataLoader:
+    generator = torch.Generator().manual_seed(seed)
+    return DataLoader(
+        TensorDataset(*tensors),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=0,
+        generator=generator,
+        drop_last=False,
+    )
+
+
+def build_model(
+    training_features: Tensor,
+    hidden_dims: tuple[int, ...],
+) -> OptionMLP:
+    mean = training_features.mean(dim=0)
+    scale = training_features.std(dim=0, unbiased=False).clamp_min(1e-6)
+    return OptionMLP(
+        input_mean=mean.tolist(),
+        input_scale=scale.tolist(),
+        hidden_dims=hidden_dims,
+        enforce_call_bounds=True,
+    )
+
+
+def evaluate_model(
+    model: nn.Module,
+    loader: DataLoader,
+    *,
+    device: torch.device,
+) -> dict[str, float]:
     model.eval()
-    sums = {"total": 0.0, "price": 0.0, "delta": 0.0, "vega": 0.0}
+    price_predictions: list[Tensor] = []
+    delta_predictions: list[Tensor] = []
+    vega_predictions: list[Tensor] = []
+    price_targets: list[Tensor] = []
+    delta_targets: list[Tensor] = []
+    vega_targets: list[Tensor] = []
 
-    for x, price, delta, vega in loader:
-        x, price, delta, vega = [t.to(device) for t in (x, price, delta, vega)]
-        torch.set_grad_enabled(True)
-        total_loss, mets = differential_loss(
+    for inputs, price, delta, vega in loader:
+        inputs = inputs.to(device)
+        predicted_price, predicted_delta, predicted_vega = price_and_greeks(
             model,
-            x,
-            price,
-            delta,
-            vega,
-            lambda_delta,
-            lambda_vega,
-            s_scale=s_scale,
-            sigma_scale=sigma_scale,
+            inputs,
+            create_graph=False,
         )
+        price_predictions.append(predicted_price.detach().cpu())
+        delta_predictions.append(predicted_delta.detach().cpu())
+        vega_predictions.append(predicted_vega.detach().cpu())
+        price_targets.append(price)
+        delta_targets.append(delta)
+        vega_targets.append(vega)
 
-        b = x.size(0)
-        sums["total"] += total_loss.item() * b
-        sums["price"] += mets["price"].item() * b
-        sums["delta"] += mets["delta"].item() * b
-        sums["vega"] += mets["vega"].item() * b
+    predicted_price = torch.cat(price_predictions)
+    predicted_delta = torch.cat(delta_predictions)
+    predicted_vega = torch.cat(vega_predictions)
+    true_price = torch.cat(price_targets)
+    true_delta = torch.cat(delta_targets)
+    true_vega = torch.cat(vega_targets)
 
-    return {
-        "total": sums["total"] / n_obs,
-        "price": (sums["price"] / n_obs) ** 0.5,
-        "delta": (sums["delta"] / n_obs) ** 0.5,
-        "vega": (sums["vega"] / n_obs) ** 0.5,
-    }
+    def rmse(prediction: Tensor, target: Tensor) -> float:
+        return float(torch.sqrt(torch.mean((prediction - target) ** 2)))
 
+    def mae(prediction: Tensor, target: Tensor) -> float:
+        return float(torch.mean(torch.abs(prediction - target)))
 
-def compute_test_metrics(model, test_df, feature_mean, feature_std, device):
-    model.eval()
-    x_df = (test_df[FEATURE_COLS] - feature_mean) / feature_std
-    x = torch.tensor(x_df.values, dtype=torch.float32, device=device).requires_grad_(True)
-    y_true = test_df["price"].to_numpy()
-    delta_true = test_df["delta"].to_numpy()
-    vega_true = test_df["vega"].to_numpy()
-
-    pred_price = model(x)
-    grads = torch.autograd.grad(
-        outputs=pred_price,
-        inputs=x,
-        grad_outputs=torch.ones_like(pred_price),
-        create_graph=False,
-    )[0]
-
-    pred_price_np = pred_price.detach().cpu().numpy()
-    pred_delta_np = grads[:, 0].detach().cpu().numpy() / float(feature_std["S"])
-    pred_vega_np = grads[:, 4].detach().cpu().numpy() / float(feature_std["sigma"])
-
-    price_rmse = float(np.sqrt(np.mean((pred_price_np - y_true) ** 2)))
-    delta_rmse = float(np.sqrt(np.mean((pred_delta_np - delta_true) ** 2)))
-    vega_rmse = float(np.sqrt(np.mean((pred_vega_np - vega_true) ** 2)))
-
-    norm_denom = float(np.mean(np.abs(y_true))) if np.mean(np.abs(y_true)) > 1e-8 else 1.0
-    nrmse = price_rmse / norm_denom
-
-    mape_mask = np.abs(y_true) > 1e-3
-    if mape_mask.any():
-        mape = float(np.mean(np.abs((pred_price_np[mape_mask] - y_true[mape_mask]) / y_true[mape_mask])) * 100.0)
-    else:
-        mape = float("nan")
-
-    abs_err = np.abs(pred_price_np - y_true)
-    cutoff = np.quantile(abs_err, 0.9)
-    worst_decile_error = float(abs_err[abs_err >= cutoff].mean())
-
+    price_rmse = rmse(predicted_price, true_price)
+    mean_abs_price = max(float(torch.mean(torch.abs(true_price))), 1e-8)
     return {
         "price_rmse": price_rmse,
-        "nrmse": nrmse,
-        "mape_ex_near_zero_pct": mape,
-        "delta_rmse": delta_rmse,
-        "vega_rmse": vega_rmse,
-        "worst_decile_abs_error": worst_decile_error,
+        "price_mae": mae(predicted_price, true_price),
+        "price_nrmse_pct": 100.0 * price_rmse / mean_abs_price,
+        "delta_rmse": rmse(predicted_delta, true_delta),
+        "delta_mae": mae(predicted_delta, true_delta),
+        "vega_rmse": rmse(predicted_vega, true_vega),
+        "vega_mae": mae(predicted_vega, true_vega),
+        "test_rows": float(len(true_price)),
     }
 
 
-def main():
-    lr_list = [1e-3, 5e-4]
-    bs_list = [128, 256]
-    lambda_grid = [0.5, 1.0, 2.0]
-    epochs = 20
+def train_candidate(
+    model: OptionMLP,
+    training_loader: DataLoader,
+    validation_loader: DataLoader,
+    *,
+    scales: LossScales,
+    weights: DifferentialLossWeights,
+    config: TrainingConfig,
+    device: torch.device,
+    differential: bool,
+) -> tuple[OptionMLP, list[dict[str, float]]]:
+    model.to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    best_validation_score = math.inf
+    best_state = copy.deepcopy(model.state_dict())
+    epochs_without_improvement = 0
+    history: list[dict[str, float]] = []
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Init] Using device: {device}\n")
+    for epoch in range(1, config.epochs + 1):
+        model.train()
+        running_loss = 0.0
+        rows_seen = 0
 
-    os.makedirs("data", exist_ok=True)
+        for inputs, price, delta, vega in training_loader:
+            inputs = inputs.to(device)
+            price = price.to(device)
+            delta = delta.to(device)
+            vega = vega.to(device)
 
-    # Generate and split base samples before any augmentation.
-    train_base_df, val_df, test_df = split_base_data(n_samples=20000, seed=42, val_size=0.15, test_size=0.15)
-
-    # Augment training data only.
-    train_aug_df = augment_dataframe(train_base_df, seed=43, noise_std=0.01)
-    train_df = pd.concat([train_base_df, train_aug_df], ignore_index=True)
-
-    train_df.to_csv("data/train.csv", index=False)
-    val_df.to_csv("data/val.csv", index=False)
-    test_df.to_csv("data/test.csv", index=False)
-
-    feature_mean = train_df[FEATURE_COLS].mean()
-    feature_std = train_df[FEATURE_COLS].std().replace(0.0, 1.0)
-
-    train_ds = OptionDataset(train_df, feature_mean, feature_std)
-    val_ds = OptionDataset(val_df, feature_mean, feature_std)
-
-    n_train, n_val = len(train_ds), len(val_ds)
-
-    # Variance-aware base weights.
-    price_var = float(train_df["price"].var())
-    delta_var = float(train_df["delta"].var())
-    vega_var = float(train_df["vega"].var())
-    base_lambda_delta = price_var / max(delta_var, 1e-8)
-    base_lambda_vega = price_var / max(vega_var, 1e-8)
-
-    best_score = float("inf")
-    best_cfg = (lr_list[0], bs_list[0], lambda_grid[0], lambda_grid[0])
-
-    for lr, batch_size, scale_delta, scale_vega in itertools.product(
-        lr_list, bs_list, lambda_grid, lambda_grid
-    ):
-        lambda_delta = base_lambda_delta * scale_delta
-        lambda_vega = base_lambda_vega * scale_vega
-        print(
-            f"Trying lr={lr}, bs={batch_size}, lambda_delta={lambda_delta:.4f} "
-            f"(x{scale_delta}), lambda_vega={lambda_vega:.4f} (x{scale_vega})"
-        )
-
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-
-        model = OptionMLP().to(device)
-        opt = optim.Adam(model.parameters(), lr=lr)
-
-        for epoch in range(1, epochs + 1):
-            m_tr = train_epoch(
-                model,
-                train_loader,
-                opt,
-                device,
-                lambda_delta,
-                lambda_vega,
-                n_train,
-                float(feature_std["S"]),
-                float(feature_std["sigma"]),
-            )
-            m_val = evaluate(
-                model,
-                val_loader,
-                device,
-                lambda_delta,
-                lambda_vega,
-                n_val,
-                float(feature_std["S"]),
-                float(feature_std["sigma"]),
-            )
-
-            if epoch % 5 == 0:
-                print(
-                    f"  epoch {epoch:02d} | total-trn:{m_tr['total']:.4f} val:{m_val['total']:.4f} "
-                    f"| price-RMSE:{m_tr['price']:.4f}/{m_val['price']:.4f} "
-                    f"| delta-RMSE:{m_tr['delta']:.4f}/{m_val['delta']:.4f} "
-                    f"| vega-RMSE:{m_tr['vega']:.4f}/{m_val['vega']:.4f}"
+            optimizer.zero_grad(set_to_none=True)
+            if differential:
+                loss, _ = differential_loss(
+                    model,
+                    inputs,
+                    price,
+                    delta,
+                    vega,
+                    scales=scales,
+                    weights=weights,
+                    create_graph=True,
+                )
+            else:
+                loss = price_only_loss(
+                    model,
+                    inputs,
+                    price,
+                    price_scale=scales.price,
                 )
 
-        if m_val["total"] < best_score:
-            best_score = m_val["total"]
-            best_cfg = (lr, batch_size, scale_delta, scale_vega)
-            torch.save(model.state_dict(), "dml_pricer_best.pth")
-            print(f"  New best config saved: total-val={best_score:.6f}\n")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+            optimizer.step()
+            batch_size = len(inputs)
+            running_loss += float(loss.detach().cpu()) * batch_size
+            rows_seen += batch_size
 
-    # Final untouched test evaluation once.
-    best_model = OptionMLP().to(device)
-    best_model.load_state_dict(torch.load("dml_pricer_best.pth", map_location=device))
-    test_metrics = compute_test_metrics(best_model, test_df, feature_mean, feature_std, device)
+        validation_metrics = evaluate_model(
+            model,
+            validation_loader,
+            device=device,
+        )
+        if differential:
+            validation_score = (
+                validation_metrics["price_rmse"] / scales.price
+                + validation_metrics["delta_rmse"] / scales.delta
+                + validation_metrics["vega_rmse"] / scales.vega
+            )
+        else:
+            validation_score = validation_metrics["price_rmse"] / scales.price
+        epoch_record = {
+            "epoch": float(epoch),
+            "training_loss": running_loss / max(rows_seen, 1),
+            "validation_score": validation_score,
+            **{f"validation_{key}": value for key, value in validation_metrics.items()},
+        }
+        history.append(epoch_record)
 
-    print(
-        f"\nBest config: lr={best_cfg[0]}, bs={best_cfg[1]}, "
-        f"lambda_delta-scale={best_cfg[2]}, lambda_vega-scale={best_cfg[3]} -> val-total={best_score:.6f}"
+        if validation_score < best_validation_score - 1e-6:
+            best_validation_score = validation_score
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if epoch == 1 or epoch % 10 == 0:
+            label = "DML" if differential else "price-only"
+            print(
+                f"[{label}] epoch={epoch:03d} "
+                f"train_loss={epoch_record['training_loss']:.6f} "
+                f"val_score={validation_score:.6f}"
+            )
+
+        if epochs_without_improvement >= config.patience:
+            break
+
+    model.load_state_dict(best_state)
+    model.to(device)
+    model.eval()
+    return model, history
+
+
+def train_pipeline(
+    config: TrainingConfig,
+    *,
+    compare_baseline: bool = False,
+    output_dir: str | Path = "artifacts",
+) -> dict[str, Any]:
+    config.validate()
+    set_seed(config.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    bounds = SamplingBounds()
+    frame = generate_synthetic_data(
+        n_samples=config.samples,
+        seed=config.seed,
+        bounds=bounds,
+        augment=False,
     )
-    print("\nUntouched test-set metrics")
-    for k, v in test_metrics.items():
-        print(f"  {k}: {v:.6f}")
+    train_frame, validation_frame, test_frame = split_frame(
+        frame,
+        seed=config.seed,
+        validation_fraction=config.validation_fraction,
+        test_fraction=config.test_fraction,
+    )
+
+    train_tensors = frame_to_tensors(train_frame)
+    validation_tensors = frame_to_tensors(validation_frame)
+    test_tensors = frame_to_tensors(test_frame)
+    scales = LossScales.from_targets(
+        train_tensors[1],
+        train_tensors[2],
+        train_tensors[3],
+    )
+    weights = DifferentialLossWeights(price=1.0, delta=1.0, vega=1.0)
+
+    train_loader = make_loader(
+        train_tensors,
+        batch_size=config.batch_size,
+        shuffle=True,
+        seed=config.seed,
+    )
+    validation_loader = make_loader(
+        validation_tensors,
+        batch_size=config.batch_size,
+        shuffle=False,
+        seed=config.seed + 1,
+    )
+    test_loader = make_loader(
+        test_tensors,
+        batch_size=config.batch_size,
+        shuffle=False,
+        seed=config.seed + 2,
+    )
+
+    model = build_model(train_tensors[0], config.hidden_dims)
+    model, dml_history = train_candidate(
+        model,
+        train_loader,
+        validation_loader,
+        scales=scales,
+        weights=weights,
+        config=config,
+        device=device,
+        differential=True,
+    )
+    dml_metrics = evaluate_model(model, test_loader, device=device)
+
+    baseline_metrics: dict[str, float] | None = None
+    if compare_baseline:
+        set_seed(config.seed)
+        baseline = build_model(train_tensors[0], config.hidden_dims)
+        baseline, _ = train_candidate(
+            baseline,
+            train_loader,
+            validation_loader,
+            scales=scales,
+            weights=weights,
+            config=config,
+            device=device,
+            differential=False,
+        )
+        baseline_metrics = evaluate_model(
+            baseline,
+            test_loader,
+            device=device,
+        )
+
+    metadata: dict[str, Any] = {
+        "training_config": asdict(config),
+        "sampling_bounds": bounds.to_dict(),
+        "loss": loss_metadata(scales, weights),
+        "metrics": dml_metrics,
+        "baseline_metrics": baseline_metrics,
+        "device_used_for_training": str(device),
+        "training_history": dml_history,
+        "model_scope": "no-dividend European calls under Black-Scholes",
+    }
+
+    output_directory = Path(output_dir)
+    checkpoint_path = save_checkpoint(
+        output_directory / "dml_option_pricer.pt",
+        model,
+        metadata=metadata,
+    )
+    output_directory.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_directory / "metrics.json"
+    metrics_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    print(f"Saved checkpoint to {checkpoint_path}")
+    print(f"Saved metrics to {metrics_path}")
+    print(json.dumps(dml_metrics, indent=2))
+    return metadata
 
 
-if __name__ == "__main__":
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train the differential option pricer")
+    parser.add_argument("--samples", type=int, default=20_000)
+    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--patience", type=int, default=12)
+    parser.add_argument("--compare-baseline", action="store_true")
+    parser.add_argument("--output-dir", default="artifacts")
+    return parser.parse_args()
+
+
+def main() -> None:  # pragma: no cover - exercised through CLI
+    args = parse_args()
+    config = TrainingConfig(
+        samples=args.samples,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        seed=args.seed,
+        patience=args.patience,
+    )
+    train_pipeline(
+        config,
+        compare_baseline=args.compare_baseline,
+        output_dir=args.output_dir,
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover
     main()

@@ -1,228 +1,318 @@
-# streamlit_app/app.py
+from __future__ import annotations
 
-import streamlit as st
-import sys, os, json
-import torch
+import json
+import math
+import sys
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import streamlit as st
+import torch
 
-# 1) Page config (must be first)
-st.set_page_config(
-    page_title="🔥 DML Option Pricer Dashboard",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-# 2) Add project root to PYTHONPATH
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from models.dml_model import OptionMLP
-from data.bs_data_generator import (
+from data.bs_data_generator import (  # noqa: E402
     black_scholes_call_price,
     black_scholes_delta,
     black_scholes_vega,
 )
+from models.dml_model import load_checkpoint, price_and_greeks  # noqa: E402
 
-# 3) Load & cache model
+DEFAULT_CHECKPOINT = PROJECT_ROOT / "artifacts" / "dml_option_pricer.pt"
+
+
 @st.cache_resource
-def load_model():
-    path   = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "dml_pricer_best.pth"))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = OptionMLP().to(device)
-    model.load_state_dict(torch.load(path, map_location=device))
-    model.eval()
-    return model, device
+def cached_checkpoint(path_text: str, modified_ns: int):
+    del modified_ns
+    return load_checkpoint(path_text, device="cpu")
 
-model, device = load_model()
 
-# 4) Top-level cached surface generator
-@st.cache_data(show_spinner=True)
-def generate_surfaces(S_min, S_max, T_min, T_max, n_pts, K, r, sigma):
-    S_vals = np.linspace(S_min, S_max, n_pts)
-    T_vals = np.linspace(T_min, T_max, n_pts)
-    Sg, Tg = np.meshgrid(S_vals, T_vals)
-    Kg = np.full_like(Sg, K)
-    rg = np.full_like(Sg, r)
-    sg = np.full_like(Sg, sigma)
-
-    p_bsm = black_scholes_call_price(Sg, Kg, Tg, rg, sg)
-    d_bsm = black_scholes_delta(Sg, Kg, Tg, rg, sg)
-    v_bsm = black_scholes_vega(Sg, Kg, Tg, rg, sg)
-
-    X = (
-        torch.tensor(
-            np.stack([Sg.ravel(), Kg.ravel(), Tg.ravel(), rg.ravel(), sg.ravel()], axis=1),
-            dtype=torch.float32, device=device
+def load_demo_model(path: Path):
+    if not path.exists():
+        st.error(
+            "No compatible checkpoint was found. Run `python -m train.train_model` "
+            "from the repository root, then reload this page."
         )
-        .requires_grad_(True)
-    )
-    pred = model(X).squeeze()
-    p_ml = pred.detach().cpu().numpy().reshape(Sg.shape)
-    grads = torch.autograd.grad(
-        outputs=pred,
-        inputs=X,
-        grad_outputs=torch.ones_like(pred),
-        create_graph=False
-    )[0].cpu().numpy().reshape(Sg.shape + (5,))
-    d_ml = grads[..., 0]
-    v_ml = grads[..., 4]
+        st.stop()
+    try:
+        return cached_checkpoint(str(path), path.stat().st_mtime_ns)
+    except (ValueError, RuntimeError) as exc:
+        st.error(f"The checkpoint is incompatible: {exc}")
+        st.stop()
 
-    df_flat = pd.DataFrame({
-        "S": Sg.ravel(),
-        "T": Tg.ravel(),
-        "BSM_Price":  p_bsm.ravel(),
-        "ML_Price":   p_ml.ravel(),
-        "Price_Error": np.abs(p_ml - p_bsm).ravel(),
-        "Delta_Error": np.abs(d_ml - d_bsm).ravel(),
-        "Vega_Error":  np.abs(v_ml - v_bsm).ravel(),
-    })
 
-    return S_vals, T_vals, p_bsm, p_ml, d_bsm, d_ml, v_bsm, v_ml, df_flat
-
-# 5) Sidebar with inputs & model card
-with st.sidebar:
-    st.header("Parameters")
-    with st.expander("Basic Inputs", expanded=True):
-        S0 = st.number_input("Spot Price S₀",      0.0, 500.0, 100.0, step=1.0)
-        K  = st.number_input("Strike Price K",     0.0, 500.0, 100.0, step=1.0)
-        T0 = st.number_input("Time to Maturity T₀",0.0,   5.0,   1.0, step=0.1)
-    with st.expander("Advanced Inputs"):
-        r     = st.number_input("Risk-Free Rate r", 0.0, 0.2,   0.01, step=0.001, format="%.3f")
-        sigma = st.number_input("Volatility σ",      0.0, 1.0,   0.20, step=0.01)
-        seed  = st.number_input("Random Seed",       0,   100000, 42,   step=1)
-    st.markdown("---")
-    st.header("About this Model")
-    st.markdown(
-        """
-- **Training ranges:**  
-  S∈[50,150], K∈[50,150], T∈[0.1,2.0], r∈[0.01,0.05], σ∈[0.1,0.5]  
-- **Loss weights:** λΔ=2.0, λν=0.5  
-- **Architecture:** 3-layer MLP, SiLU activations  
-- **Limitations:** European calls only; no early exercise; no stochastic vol  
-        """
-    )
-    metadata = {
-        "training_ranges": {"S":[50,150],"K":[50,150],"T":[0.1,2.0],"r":[0.01,0.05],"sigma":[0.1,0.5]},
-        "loss_weights": {"lambda_delta":2.0,"lambda_vega":0.5},
-        "architecture": "3-layer MLP, SiLU",
-        "limitations": ["European calls","no early exercise","no stoch vol"]
+def model_card(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "scope": metadata.get("model_scope", "no-dividend European calls"),
+        "sampling_bounds": metadata.get("sampling_bounds", {}),
+        "test_metrics": metadata.get("metrics", {}),
+        "baseline_metrics": metadata.get("baseline_metrics"),
+        "loss": metadata.get("loss", {}),
+        "limitations": [
+            "Black-Scholes synthetic supervision",
+            "European calls only",
+            "No dividends, early exercise or stochastic volatility",
+            "Extrapolation outside the training domain is not validated",
+        ],
     }
-    st.download_button(
-        "Download Model Card (JSON)",
-        data=json.dumps(metadata, indent=2),
-        file_name="model_card.json",
-        mime="application/json"
+
+
+def in_training_domain(
+    values: dict[str, float],
+    bounds: dict[str, Any],
+) -> bool:
+    mapping = {
+        "S": "spot",
+        "K": "strike",
+        "T": "maturity",
+        "r": "rate",
+        "sigma": "volatility",
+    }
+    for feature_name, bound_name in mapping.items():
+        if bound_name not in bounds:
+            continue
+        low, high = bounds[bound_name]
+        if not low <= values[feature_name] <= high:
+            return False
+    return True
+
+
+def predict_single(
+    model: torch.nn.Module,
+    values: dict[str, float],
+) -> dict[str, float]:
+    inputs = torch.tensor(
+        [[values["S"], values["K"], values["T"], values["r"], values["sigma"]]],
+        dtype=torch.float32,
+    )
+    price, delta, vega = price_and_greeks(model, inputs)
+    return {
+        "price": float(price.item()),
+        "delta": float(delta.item()),
+        "vega": float(vega.item()),
+    }
+
+
+def predict_grid(
+    model: torch.nn.Module,
+    inputs: np.ndarray,
+    *,
+    batch_size: int = 4096,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    prices: list[np.ndarray] = []
+    deltas: list[np.ndarray] = []
+    vegas: list[np.ndarray] = []
+
+    for start in range(0, len(inputs), batch_size):
+        batch = torch.tensor(inputs[start : start + batch_size], dtype=torch.float32)
+        price, delta, vega = price_and_greeks(model, batch)
+        prices.append(price.detach().numpy())
+        deltas.append(delta.detach().numpy())
+        vegas.append(vega.detach().numpy())
+
+    return (
+        np.concatenate(prices),
+        np.concatenate(deltas),
+        np.concatenate(vegas),
     )
 
-# 6) Main header & summary
-st.title("🔥 Differential ML Option Pricer Dashboard")
-st.markdown(
-    "**Executive Summary:** ML pricer yields <1% price RMSE & single-digit Greek RMSE vs. BSM."
-)
 
-# 7) Tabs & UI
-tab1, tab2 = st.tabs(["📊 Overview", "🔎 Deep Analysis"])
+def main() -> None:
+    st.set_page_config(
+        page_title="Differential ML Option Pricer",
+        page_icon="📈",
+        layout="wide",
+    )
+    model, metadata = load_demo_model(DEFAULT_CHECKPOINT)
+    card = model_card(metadata)
 
-def show_overview():
-    st.subheader("1️⃣ One-Shot ML vs. BSM")
-    if st.button("▶️ Compute"):
-        x = torch.tensor([[S0, K, T0, r, sigma]],
-                         dtype=torch.float32,
-                         device=device).requires_grad_(True)
-        pred = model(x).squeeze()
-        pm = pred.item()
-        grad = torch.autograd.grad(pred, x, grad_outputs=torch.tensor(1.0, device=device))[0]
-        dm, vm = grad[0,0].item(), grad[0,4].item()
-        pb = black_scholes_call_price(S0, K, T0, r, sigma)
-        db = black_scholes_delta(S0, K, T0, r, sigma)
-        vb = black_scholes_vega(S0, K, T0, r, sigma)
+    st.title("Differential ML Option Pricer")
+    st.caption(
+        "A bounded neural surrogate for no-dividend European calls, trained on "
+        "Black-Scholes prices, deltas and vegas."
+    )
 
-        df = pd.DataFrame([
-            ["Price", pb, pm, pm-pb],
-            ["Delta", db, dm, dm-db],
-            ["Vega",  vb, vm, vm-vb],
-        ], columns=["Metric","BSM","ML","Abs Error"])
-        df["Rel (%)"] = 100*df["Abs Error"]/df["BSM"].abs()
-        st.table(df)
-        st.markdown("**Takeaways:**")
-        for _, r_ in df.iterrows():
-            st.markdown(f"- {r_.Metric}: {r_['Abs Error']:.4f} ({r_['Rel (%)']:.2f}%)")
-
-def show_deep():
-    st.subheader("2️⃣ Deep Surface & Scenario Comparison")
-    with st.form("form2"):
-        S_min, S_max = st.slider("Spot Range S₀", 0.0,500.0,(50.0,150.0))
-        T_min, T_max = st.slider("Maturity Range T",0.0,5.0,(0.1,2.0))
-        n_pts        = st.slider("Grid Points",20,200,100)
-        go           = st.form_submit_button("▶️ Run")
-    if go:
-        if S_min>=S_max or T_min>=T_max:
-            st.error("Ensure S_min < S_max and T_min < T_max")
-            return
-
-        np.random.seed(int(seed))
-        # Unpack only the first four outputs
-        aS, aT, a_p_bsm, a_p_ml, *rest = generate_surfaces(
-            S_min, S_max, T_min, T_max, n_pts, K, r, sigma
+    with st.sidebar:
+        st.header("Contract inputs")
+        spot = st.number_input("Spot (S)", min_value=0.01, value=100.0, step=1.0)
+        strike = st.number_input("Strike (K)", min_value=0.01, value=100.0, step=1.0)
+        maturity = st.number_input(
+            "Maturity in years (T)",
+            min_value=0.001,
+            value=1.0,
+            step=0.05,
+            format="%.3f",
         )
-        err = np.abs(a_p_ml - a_p_bsm)
-        idx = np.unravel_index(err.argmax(), err.shape)
-        st.markdown(f"**Max Price Error:** {err.max():.4f} at S₀={aS[idx[1]]:.2f}, T={aT[idx[0]]:.2f}")
-
-        fig = px.imshow(
-            err, x=aS, y=aT,
-            labels={"x":"Spot Price $S_0$","y":"T (years)","color":"|ML−BSM|"},
-            origin="lower", aspect="auto", title="Price Error Heatmap"
+        rate = st.number_input(
+            "Continuously compounded rate (r)",
+            min_value=-0.10,
+            max_value=0.30,
+            value=0.03,
+            step=0.005,
+            format="%.3f",
         )
-        fig.update_layout(coloraxis_colorbar=dict(
-            tickmode="array", tickvals=[0,0.5,1.0,1.5,2.0]
-        ))
-        st.plotly_chart(fig, use_container_width=True)
+        volatility = st.number_input(
+            "Volatility (sigma)",
+            min_value=0.001,
+            max_value=2.0,
+            value=0.20,
+            step=0.01,
+            format="%.3f",
+        )
+        st.download_button(
+            "Download model card",
+            data=json.dumps(card, indent=2),
+            file_name="model_card.json",
+            mime="application/json",
+        )
 
-        # Histograms
-        for col, title in [("Price_Error","Price"),("Delta_Error","Delta"),("Vega_Error","Vega")]:
-            fig2 = px.histogram(
-                pd.DataFrame({col: generate_surfaces(
-                    S_min, S_max, T_min, T_max, n_pts, K, r, sigma
-                )[8][col]}),
-                x=col, nbins=50, title=f"{title} Error Distribution"
+    values = {
+        "S": float(spot),
+        "K": float(strike),
+        "T": float(maturity),
+        "r": float(rate),
+        "sigma": float(volatility),
+    }
+    if not in_training_domain(values, card.get("sampling_bounds", {})):
+        st.warning(
+            "At least one input is outside the training domain. The neural output "
+            "is an extrapolation and should not be treated as validated."
+        )
+
+    neural = predict_single(model, values)
+    analytic = {
+        "price": float(
+            black_scholes_call_price(spot, strike, maturity, rate, volatility)
+        ),
+        "delta": float(
+            black_scholes_delta(spot, strike, maturity, rate, volatility)
+        ),
+        "vega": float(
+            black_scholes_vega(spot, strike, maturity, rate, volatility)
+        ),
+    }
+
+    columns = st.columns(3)
+    for column, key, label in zip(
+        columns,
+        ("price", "delta", "vega"),
+        ("Price", "Delta", "Vega"),
+        strict=True,
+    ):
+        difference = neural[key] - analytic[key]
+        column.metric(
+            label,
+            f"{neural[key]:.6f}",
+            delta=f"{difference:+.6f} vs BSM",
+            delta_color="off",
+        )
+
+    comparison = pd.DataFrame(
+        {
+            "Metric": ["Price", "Delta", "Vega"],
+            "Black-Scholes": [analytic["price"], analytic["delta"], analytic["vega"]],
+            "Neural": [neural["price"], neural["delta"], neural["vega"]],
+        }
+    )
+    comparison["Absolute error"] = np.abs(
+        comparison["Neural"] - comparison["Black-Scholes"]
+    )
+    comparison["Relative error (%)"] = np.where(
+        comparison["Black-Scholes"].abs() > 1e-10,
+        100.0 * comparison["Absolute error"] / comparison["Black-Scholes"].abs(),
+        np.nan,
+    )
+    st.dataframe(comparison, hide_index=True, use_container_width=True)
+
+    test_metrics = card.get("test_metrics", {})
+    if test_metrics:
+        st.subheader("Held-out synthetic test metrics")
+        metric_columns = st.columns(3)
+        metric_columns[0].metric("Price RMSE", f"{test_metrics.get('price_rmse', math.nan):.6f}")
+        metric_columns[1].metric("Delta RMSE", f"{test_metrics.get('delta_rmse', math.nan):.6f}")
+        metric_columns[2].metric("Vega RMSE", f"{test_metrics.get('vega_rmse', math.nan):.6f}")
+
+    st.subheader("Error surface")
+    surface_columns = st.columns(3)
+    spot_min, spot_max = surface_columns[0].slider(
+        "Spot range",
+        min_value=1.0,
+        max_value=300.0,
+        value=(50.0, 150.0),
+    )
+    maturity_min, maturity_max = surface_columns[1].slider(
+        "Maturity range",
+        min_value=0.01,
+        max_value=5.0,
+        value=(0.1, 2.0),
+    )
+    grid_size = surface_columns[2].slider("Grid resolution", 20, 120, 60)
+
+    spot_values = np.linspace(spot_min, spot_max, grid_size)
+    maturity_values = np.linspace(maturity_min, maturity_max, grid_size)
+    spot_grid, maturity_grid = np.meshgrid(spot_values, maturity_values)
+    grid_inputs = np.column_stack(
+        [
+            spot_grid.ravel(),
+            np.full(spot_grid.size, strike),
+            maturity_grid.ravel(),
+            np.full(spot_grid.size, rate),
+            np.full(spot_grid.size, volatility),
+        ]
+    )
+    neural_price, neural_delta, neural_vega = predict_grid(model, grid_inputs)
+    analytic_price = black_scholes_call_price(
+        grid_inputs[:, 0],
+        grid_inputs[:, 1],
+        grid_inputs[:, 2],
+        grid_inputs[:, 3],
+        grid_inputs[:, 4],
+    )
+    analytic_delta = black_scholes_delta(
+        grid_inputs[:, 0],
+        grid_inputs[:, 1],
+        grid_inputs[:, 2],
+        grid_inputs[:, 3],
+        grid_inputs[:, 4],
+    )
+    analytic_vega = black_scholes_vega(
+        grid_inputs[:, 0],
+        grid_inputs[:, 1],
+        grid_inputs[:, 2],
+        grid_inputs[:, 3],
+        grid_inputs[:, 4],
+    )
+
+    surface_tabs = st.tabs(["Price", "Delta", "Vega"])
+    surfaces = (
+        (surface_tabs[0], np.abs(neural_price - analytic_price), "Absolute price error"),
+        (surface_tabs[1], np.abs(neural_delta - analytic_delta), "Absolute delta error"),
+        (surface_tabs[2], np.abs(neural_vega - analytic_vega), "Absolute vega error"),
+    )
+    for tab, error_values, title in surfaces:
+        with tab:
+            error_grid = error_values.reshape(spot_grid.shape)
+            figure = px.imshow(
+                error_grid,
+                x=spot_values,
+                y=maturity_values,
+                origin="lower",
+                aspect="auto",
+                labels={"x": "Spot", "y": "Maturity", "color": "Absolute error"},
+                title=title,
             )
-            fig2.update_layout(xaxis_title="Error", yaxis_title="Count")
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(figure, use_container_width=True)
 
-        # Scenario Manager
-        if "scenarios" not in st.session_state:
-            st.session_state.scenarios = {}
-        with st.expander("📂 Scenario Manager", expanded=True):
-            name = st.text_input("Scenario Name", key="nm2")
-            if st.button("Save Scenario"):
-                st.session_state.scenarios[name] = (S_min, S_max, T_min, T_max, n_pts)
-                st.success(f"Saved '{name}'")
-            sel = st.multiselect("Compare Scenarios", list(st.session_state.scenarios.keys()))
-            if sel:
-                cols = st.columns(len(sel))
-                for col_ui, sc in zip(cols, sel):
-                    p = st.session_state.scenarios[sc]
-                    bS, bT, bp, mp, *_ = generate_surfaces(*p, K, r, sigma)
-                    e = np.abs(mp - bp)
-                    piv = pd.DataFrame({
-                        "T": np.repeat(bT, len(bS)),
-                        "S": np.tile(bS, len(bT)),
-                        "Error": e.ravel()
-                    }).pivot(index="T", columns="S", values="Error")
-                    fig3 = px.imshow(
-                        piv.values, x=piv.columns, y=piv.index,
-                        labels={"x":"S₀","y":"T","color":"|ML−BSM|"},
-                        origin="lower", aspect="auto", title=sc
-                    )
-                    fig3.update_layout(coloraxis_colorbar=dict(
-                        tickmode="array", tickvals=[0,0.5,1.0,1.5,2.0]
-                    ))
-                    col_ui.plotly_chart(fig3, use_container_width=True)
+    st.info(
+        "This is an educational surrogate-model demonstration. It is not a "
+        "market-calibrated pricing library or trading recommendation."
+    )
 
-# 8) Render tabs
-with tab1:
-    show_overview()
-with tab2:
-    show_deep()
+
+if __name__ == "__main__":
+    main()
