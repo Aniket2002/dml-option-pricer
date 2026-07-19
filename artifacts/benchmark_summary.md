@@ -11,8 +11,8 @@ The DML and price-only models use the same split, architecture, initialisation s
 
 | Metric | DML | Price-only baseline | Error reduction |
 |---|---:|---:|---:|
-| Price RMSE | 0.390210 | 0.528063 | 26.1% |
-| Delta RMSE | 0.044585 | 0.111495 | 60.0% |
-| Vega RMSE | 1.071430 | 4.344177 | 75.3% |
+| Price RMSE | 0.390209 | 0.471122 | 17.2% |
+| Delta RMSE | 0.044585 | 0.104878 | 57.5% |
+| Vega RMSE | 1.071429 | 4.006978 | 73.3% |
 
 These results measure approximation error on a held-out synthetic Black-Scholes test set; they are not evidence of market calibration.
