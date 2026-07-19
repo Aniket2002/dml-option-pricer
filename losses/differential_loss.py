@@ -12,7 +12,9 @@ def differential_loss(
     true_delta: Tensor,
     true_vega: Tensor,
     lambda_delta: float = 1.0,
-    lambda_vega: float = 1.0
+    lambda_vega: float = 1.0,
+    s_scale: float = 1.0,
+    sigma_scale: float = 1.0,
 ) -> Tuple[Tensor, Dict[str, Tensor]]:
     """
     Returns:
@@ -35,8 +37,8 @@ def differential_loss(
         grad_outputs=torch.ones_like(pred_price),
         create_graph=True
     )[0]
-    pred_delta = grads[:, 0]
-    pred_vega  = grads[:, 4]
+    pred_delta = grads[:, 0] / s_scale
+    pred_vega  = grads[:, 4] / sigma_scale
 
     # 3) greek losses
     delta_loss = F.mse_loss(pred_delta, true_delta)

@@ -27,6 +27,7 @@ class OptionMLP(nn.Module):
         layers.append(nn.Linear(prev_dim, 1))  # Output: scalar option price
 
         self.model = nn.Sequential(*layers)
+        self.out_activation = nn.Softplus()
         self._init_weights()
 
     def _init_weights(self):
@@ -44,7 +45,7 @@ class OptionMLP(nn.Module):
             x: Tensor of shape (batch_size, 5), columns = [S, K, T, r, sigma].
         
         Returns:
-            Tensor of shape (batch_size,) with predicted option prices.
+            Tensor of shape (batch_size,) with non-negative predicted option prices.
         """
-        price = self.model(x).squeeze(-1)
+        price = self.out_activation(self.model(x)).squeeze(-1)
         return price
