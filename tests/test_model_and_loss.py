@@ -54,6 +54,39 @@ def test_model_enforces_call_price_bounds_and_has_raw_unit_greeks():
     assert torch.isfinite(vega).all()
 
 
+def test_autograd_greeks_match_central_finite_differences():
+    torch.manual_seed(13)
+    model = OptionMLP(hidden_dims=(16, 8)).double().eval()
+    inputs = torch.tensor(
+        [[120.0, 100.0, 1.25, 0.03, 0.25]],
+        dtype=torch.float64,
+    )
+
+    _, autograd_delta, autograd_vega = price_and_greeks(model, inputs)
+
+    def central_difference(feature_index: int, step: float) -> torch.Tensor:
+        upper = inputs.clone()
+        lower = inputs.clone()
+        upper[:, feature_index] += step
+        lower[:, feature_index] -= step
+        with torch.no_grad():
+            return (model(upper) - model(lower)) / (2.0 * step)
+
+    finite_difference_delta = central_difference(0, 1e-4)
+    finite_difference_vega = central_difference(4, 1e-5)
+
+    assert autograd_delta == pytest.approx(
+        finite_difference_delta,
+        rel=1e-5,
+        abs=1e-7,
+    )
+    assert autograd_vega == pytest.approx(
+        finite_difference_vega,
+        rel=1e-5,
+        abs=1e-6,
+    )
+
+
 def test_differential_loss_is_near_zero_for_analytic_model():
     inputs = torch.tensor(
         [[80.0, 100.0, 0.5, 0.03, 0.20], [100.0, 100.0, 1.0, 0.05, 0.20]],

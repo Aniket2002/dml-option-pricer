@@ -71,5 +71,10 @@ def test_training_pipeline_smoke(tmp_path):
 
     assert (tmp_path / "dml_option_pricer.pt").exists()
     assert (tmp_path / "metrics.json").exists()
+    benchmark_path = tmp_path / "benchmark_summary.md"
+    assert benchmark_path.exists()
+    benchmark_text = benchmark_path.read_text(encoding="utf-8")
+    assert "Price-only baseline" in benchmark_text
+    assert "held-out synthetic" in benchmark_text
     assert metadata["metrics"]["test_rows"] > 0
     assert metadata["baseline_metrics"] is not None

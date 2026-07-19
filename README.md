@@ -27,7 +27,7 @@ It is an educational surrogate-model project, not a market-calibrated pricing sy
 
 ## Installation
 
-Tested in CI on Python 3.10, 3.11 and 3.12.
+CI is configured for Python 3.10, 3.11 and 3.12.
 
 ```bash
 python -m venv .venv
@@ -65,7 +65,16 @@ The script creates:
 ```text
 artifacts/dml_option_pricer.pt
 artifacts/metrics.json
+artifacts/benchmark_summary.md
 ```
+
+## Generated benchmark summary
+
+The compact benchmark is generated from the same metadata as the checkpoint; it is not maintained as a separate hand-written performance claim:
+
+[Open the latest generated benchmark summary](artifacts/benchmark_summary.md)
+
+When `--compare-baseline` is enabled, the DML and price-only models use the same train/validation/test split, architecture, initialisation seed and shuffled batch order.
 
 The checkpoint stores the model state, input-scaling statistics, architecture and training metadata. Legacy state-dict-only checkpoints are intentionally rejected because they do not contain the scaling information needed for correct raw-unit Greeks.
 

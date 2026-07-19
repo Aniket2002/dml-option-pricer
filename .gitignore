@@ -19,3 +19,5 @@ artifacts/*
 !artifacts/.gitkeep
 !artifacts/metrics.json
 !artifacts/dml_option_pricer.pt
+
+!artifacts/benchmark_summary.md
