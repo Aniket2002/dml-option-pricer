@@ -280,8 +280,7 @@ def train_candidate(
         if validation_score < best_validation_score - 1e-6:
             best_validation_score = validation_score
             best_state = {
-                key: value.detach().cpu().clone()
-                for key, value in model.state_dict().items()
+                key: value.detach().cpu().clone() for key, value in model.state_dict().items()
             }
             epochs_without_improvement = 0
         else:
@@ -499,8 +498,7 @@ def render_benchmark_summary(metadata: dict[str, Any]) -> str:
         improvement = _improvement_pct(candidate_value, baseline_value)
         improvement_text = "n/a" if improvement is None else f"{improvement:.1f}%"
         lines.append(
-            f"| {label} | {candidate_value:.6f} | "
-            f"{baseline_value:.6f} | {improvement_text} |"
+            f"| {label} | {candidate_value:.6f} | {baseline_value:.6f} | {improvement_text} |"
         )
 
     lines.extend(

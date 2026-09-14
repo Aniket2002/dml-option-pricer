@@ -26,10 +26,9 @@ class TorchBlackScholesCall(nn.Module):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         spot, strike, maturity, rate, volatility = inputs.unbind(dim=1)
         root_t = torch.sqrt(maturity)
-        d1 = (
-            torch.log(spot / strike)
-            + (rate + 0.5 * volatility**2) * maturity
-        ) / (volatility * root_t)
+        d1 = (torch.log(spot / strike) + (rate + 0.5 * volatility**2) * maturity) / (
+            volatility * root_t
+        )
         d2 = d1 - volatility * root_t
         return spot * torch.special.ndtr(d1) - strike * torch.exp(
             -rate * maturity

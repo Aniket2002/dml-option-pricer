@@ -109,7 +109,9 @@ def black_scholes_call_price(
     strike_array = _as_float_array(strike)
     maturity_array = _as_float_array(maturity)
     rate_array = _as_float_array(rate)
-    return spot_array * norm.cdf(d1) - strike_array * np.exp(-rate_array * maturity_array) * norm.cdf(d2)
+    return spot_array * norm.cdf(d1) - strike_array * np.exp(
+        -rate_array * maturity_array
+    ) * norm.cdf(d2)
 
 
 def black_scholes_delta(
@@ -171,17 +173,9 @@ def black_scholes_theta(
     volatility_array = _as_float_array(volatility)
 
     diffusion_term = -(
-        spot_array
-        * norm.pdf(d1)
-        * volatility_array
-        / (2.0 * np.sqrt(maturity_array))
+        spot_array * norm.pdf(d1) * volatility_array / (2.0 * np.sqrt(maturity_array))
     )
-    carry_term = -(
-        rate_array
-        * strike_array
-        * np.exp(-rate_array * maturity_array)
-        * norm.cdf(d2)
-    )
+    carry_term = -(rate_array * strike_array * np.exp(-rate_array * maturity_array) * norm.cdf(d2))
     return diffusion_term + carry_term
 
 

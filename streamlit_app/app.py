@@ -186,15 +186,9 @@ def main() -> None:
 
     neural = predict_single(model, values)
     analytic = {
-        "price": float(
-            black_scholes_call_price(spot, strike, maturity, rate, volatility)
-        ),
-        "delta": float(
-            black_scholes_delta(spot, strike, maturity, rate, volatility)
-        ),
-        "vega": float(
-            black_scholes_vega(spot, strike, maturity, rate, volatility)
-        ),
+        "price": float(black_scholes_call_price(spot, strike, maturity, rate, volatility)),
+        "delta": float(black_scholes_delta(spot, strike, maturity, rate, volatility)),
+        "vega": float(black_scholes_vega(spot, strike, maturity, rate, volatility)),
     }
 
     columns = st.columns(3)
@@ -219,9 +213,7 @@ def main() -> None:
             "Neural": [neural["price"], neural["delta"], neural["vega"]],
         }
     )
-    comparison["Absolute error"] = np.abs(
-        comparison["Neural"] - comparison["Black-Scholes"]
-    )
+    comparison["Absolute error"] = np.abs(comparison["Neural"] - comparison["Black-Scholes"])
     comparison["Relative error (%)"] = np.where(
         comparison["Black-Scholes"].abs() > 1e-10,
         100.0 * comparison["Absolute error"] / comparison["Black-Scholes"].abs(),

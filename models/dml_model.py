@@ -181,8 +181,7 @@ def load_checkpoint(
 
     if not isinstance(payload, dict) or "model_config" not in payload:
         raise ValueError(
-            "legacy state-dict-only checkpoint detected; retrain with "
-            "python -m train.train_model"
+            "legacy state-dict-only checkpoint detected; retrain with python -m train.train_model"
         )
 
     model = OptionMLP.from_config(payload["model_config"])

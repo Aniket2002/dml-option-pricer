@@ -101,11 +101,7 @@ def differential_loss(
         torch.zeros_like(true_vega),
     )
 
-    total_loss = (
-        weights.price * price_loss
-        + weights.delta * delta_loss
-        + weights.vega * vega_loss
-    )
+    total_loss = weights.price * price_loss + weights.delta * delta_loss + weights.vega * vega_loss
     metrics = {
         "total": total_loss.detach(),
         "price_normalized_mse": price_loss.detach(),
