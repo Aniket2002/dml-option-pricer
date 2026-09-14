@@ -2,6 +2,11 @@
 
 A reproducible PyTorch surrogate for **no-dividend European call options**. The model is trained on Black-Scholes prices together with analytic delta and vega labels, then evaluated against the same closed-form benchmark on a held-out synthetic test set.
 
+This is the portfolio's specialized machine-learning derivatives project. Unlike
+the broader [option-pricing toolkit](https://github.com/Aniket2002/option-pricing),
+it asks a narrower question: how can derivative labels improve a neural pricing
+surrogate while keeping the learned Greeks in financial input units?
+
 ## What is different about this implementation
 
 - **Differential supervision:** the objective includes price, delta and vega errors.
@@ -24,6 +29,20 @@ The current model covers:
 - outputs price, delta and vega.
 
 It is an educational surrogate-model project, not a market-calibrated pricing system.
+
+## Training and validation workflow
+
+```text
+seeded Black-Scholes samples
+  -> train / validation / held-out split
+  -> training-set feature and target scales
+  -> price + delta + vega supervision
+  -> early stopping on validation loss
+  -> held-out comparison with analytic Black-Scholes labels
+  -> checkpoint, metrics, and generated benchmark summary
+```
+
+The held-out set is used for final reporting, not training or early stopping.
 
 ## Installation
 
@@ -151,7 +170,3 @@ dml-option-pricer/
 - Accuracy outside the sampled domain is not established.
 - The annualized rate and volatility conventions must match the Black-Scholes inputs.
 - The no-arbitrage output layer enforces simple call bounds, not every static-arbitrage relationship across an entire surface.
-
-## Suggested CV wording
-
-> Developed a differentiable PyTorch surrogate for European call pricing, using joint price-and-Greek supervision, in-graph feature scaling for raw-unit autograd Greeks, no-arbitrage output bounds, reproducible benchmarking and an interactive error-analysis dashboard.
